@@ -515,8 +515,13 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_datetime_received)
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_command)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CommandHandler("start", start_command),
+            CommandHandler("help", start_command),
+        ],
     )
+
 
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("help", start_command))
