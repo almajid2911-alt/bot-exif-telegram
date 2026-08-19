@@ -31,6 +31,21 @@ from telegram.ext import (
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
+# Whitelist User ID yang diizinkan mengakses fitur Edit / Inject Metadata
+ALLOWED_EDIT_USER_IDS = {171053504, 179537807}
+env_allowed = os.getenv("ALLOWED_EDIT_USER_IDS", "")
+if env_allowed:
+    try:
+        for uid in env_allowed.split(","):
+            if uid.strip().isdigit():
+                ALLOWED_EDIT_USER_IDS.add(int(uid.strip()))
+    except Exception:
+        pass
+
+def is_user_allowed_edit(user_id: int) -> bool:
+    """Mengecek apakah user_id berhak mengakses fitur Edit / Inject Metadata."""
+    return user_id in ALLOWED_EDIT_USER_IDS
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
@@ -430,7 +445,6 @@ async def set_bot_commands(application):
     commands = [
         BotCommand("start", "🏠 Menu Utama"),
         BotCommand("cek", "🔍 Cek Metadata Lengkap Foto"),
-        BotCommand("edit", "✏️ Ubah / Injeksi Metadata GPS & Jam"),
         BotCommand("bandingkan", "📏 Bandingkan Jarak GPS 2 Foto"),
         BotCommand("help", "❓ Panduan Lengkap"),
         BotCommand("cancel", "❌ Batalkan Proses"),
@@ -441,13 +455,19 @@ async def set_bot_commands(application):
     except Exception as e:
         logger.warning(f"Gagal mendaftarkan bot commands popup: {e}")
 
-def get_main_menu_keyboard():
-    """Keyboard menu utama."""
-    keyboard = [
-        ["🔍 Cek Metadata Foto", "✏️ Edit / Inject Metadata"],
-        ["📏 Bandingkan 2 Foto (Cek Jarak GPS)"],
-        ["❓ Bantuan / Panduan"]
-    ]
+def get_main_menu_keyboard(user_id: int = None):
+    """Keyboard menu utama yang disesuaikan dengan hak akses user."""
+    if user_id and is_user_allowed_edit(user_id):
+        keyboard = [
+            ["🔍 Cek Metadata Foto", "✏️ Edit / Inject Metadata"],
+            ["📏 Bandingkan 2 Foto (Cek Jarak GPS)"],
+            ["❓ Bantuan / Panduan"]
+        ]
+    else:
+        keyboard = [
+            ["🔍 Cek Metadata Foto", "📏 Bandingkan 2 Foto (Cek Jarak GPS)"],
+            ["❓ Bantuan / Panduan"]
+        ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 async def download_incoming_photo(update: Update, destination_path: str) -> tuple[bool, bool]:
@@ -472,19 +492,31 @@ async def download_incoming_photo(update: Update, destination_path: str) -> tupl
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler /start & /menu"""
     context.user_data.clear()
-    text = (
-        "🤖 **Selamat Datang di Bot EXIF & Metadata Foto!**\n\n"
-        "Gunakan tombol menu popup di samping kolom pesan (**/** atau **Menu**) atau pilih opsi di bawah:\n\n"
-        "1️⃣ `/cek` — **🔍 Cek Metadata Foto**: Koordinat GPS, Google Maps, waktu, tipe HP & resolusi.\n"
-        "2️⃣ `/edit` — **✏️ Edit / Inject Metadata**: Ubah/isi koordinat lokasi GPS dan tanggal/jam foto.\n"
-        "3️⃣ `/bandingkan` — **📏 Bandingkan 2 Foto**: Hitung selisih jarak koordinat GPS (meter/km) & waktu.\n\n"
-        "💡 *Tips: Kamu juga bisa langsung kirim foto sekarang untuk langsung mengecek metadatanya.*"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
+    user_id = update.effective_user.id
+
+    if is_user_allowed_edit(user_id):
+        text = (
+            "🤖 **Selamat Datang di Bot EXIF & Metadata Foto!**\n\n"
+            "Gunakan tombol menu di bawah atau command pop-up (**/**):\n\n"
+            "1️⃣ `/cek` — **🔍 Cek Metadata Foto**: Koordinat GPS, Google Maps, waktu, tipe HP & resolusi.\n"
+            "2️⃣ `/edit` — **✏️ Edit / Inject Metadata**: Ubah/isi koordinat lokasi GPS dan tanggal/jam foto.\n"
+            "3️⃣ `/bandingkan` — **📏 Bandingkan 2 Foto**: Hitung selisih jarak koordinat GPS (meter/km) & waktu.\n\n"
+            "💡 *Tips: Kamu juga bisa langsung kirim foto sekarang untuk langsung mengecek metadatanya.*"
+        )
+    else:
+        text = (
+            "🤖 **Selamat Datang di Bot EXIF & Metadata Foto!**\n\n"
+            "Gunakan tombol menu di bawah atau command pop-up (**/**):\n\n"
+            "1️⃣ `/cek` — **🔍 Cek Metadata Foto**: Koordinat GPS, Google Maps, waktu, tipe HP & resolusi.\n"
+            "2️⃣ `/bandingkan` — **📏 Bandingkan 2 Foto**: Hitung selisih jarak koordinat GPS (meter/km) & waktu.\n\n"
+            "💡 *Tips: Kamu juga bisa langsung kirim foto sekarang untuk langsung mengecek metadatanya.*"
+        )
+
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard(user_id))
     return MENU_CHOICE
 
 async def cek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler perintah popup /cek"""
+    """Handler perintah /cek"""
     context.user_data.clear()
     context.user_data["mode"] = "check"
     await update.message.reply_text(
@@ -498,7 +530,17 @@ async def cek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_CHECK_PHOTO
 
 async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler perintah popup /edit"""
+    """Handler perintah /edit (Dibatasi hanya untuk User ID yang terdaftar)."""
+    user_id = update.effective_user.id
+    if not is_user_allowed_edit(user_id):
+        await update.message.reply_text(
+            "⛔ **Akses Terbatas**: Menu Edit/Inject Metadata dibatasi khusus untuk admin.\n\n"
+            "Anda dapat menggunakan fitur **🔍 Cek Metadata Foto** atau **📏 Bandingkan 2 Foto**.",
+            parse_mode="Markdown",
+            reply_markup=get_main_menu_keyboard(user_id)
+        )
+        return MENU_CHOICE
+
     context.user_data.clear()
     context.user_data["mode"] = "edit"
     await update.message.reply_text(
@@ -512,7 +554,7 @@ async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_EDIT_PHOTO
 
 async def bandingkan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler perintah popup /bandingkan"""
+    """Handler perintah /bandingkan"""
     context.user_data.clear()
     context.user_data["mode"] = "compare_1"
     await update.message.reply_text(
@@ -528,37 +570,51 @@ async def bandingkan_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_menu_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Mengarahkan pilihan menu utama."""
     text = update.message.text.strip() if update.message.text else ""
+    user_id = update.effective_user.id
 
-    if "Cek Metadata" in text or text.startswith("1"):
+    if "Cek Metadata" in text:
         return await cek_command(update, context)
 
-    elif "Edit" in text or "Inject" in text or text.startswith("2"):
+    elif "Edit" in text or "Inject" in text:
         return await edit_command(update, context)
 
-    elif "Bandingkan" in text or "Jarak" in text or text.startswith("3"):
+    elif "Bandingkan" in text or "Jarak" in text:
         return await bandingkan_command(update, context)
 
     elif "Bantuan" in text or "Panduan" in text:
         return await help_command(update, context)
 
     else:
-        await update.message.reply_text("Silakan pilih menu dari tombol di bawah atau gunakan command popup (**/**):", reply_markup=get_main_menu_keyboard())
+        await update.message.reply_text("Silakan pilih menu dari tombol di bawah atau gunakan command pop-up (**/**):", reply_markup=get_main_menu_keyboard(user_id))
         return MENU_CHOICE
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler /help"""
-    help_text = (
-        "📖 **PANDUAN & DAFTAR COMMAND BOT**\n\n"
-        "📌 **Daftar Perintah Pop Up:**\n"
-        "• `/start` — Membuka Menu Utama\n"
-        "• `/cek` — Cek rincian metadata lengkap foto\n"
-        "• `/edit` — Edit koordinat GPS dan tanggal/jam foto\n"
-        "• `/bandingkan` — Bandingkan selisih jarak & waktu 2 foto\n"
-        "• `/help` — Bantuan & panduan ini\n"
-        "• `/cancel` — Batalkan proses saat ini\n\n"
-        "⚠️ **Catatan Penting**: Telegram secara default mengompresi foto dan menghapus GPS saat dikirim sebagai foto biasa. Selalu gunakan opsi **'Send as File / Kirim sebagai Dokumen'** untuk hasil terbaik."
-    )
-    await update.message.reply_text(help_text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
+    user_id = update.effective_user.id
+    if is_user_allowed_edit(user_id):
+        help_text = (
+            "📖 **PANDUAN & DAFTAR COMMAND BOT**\n\n"
+            "📌 **Daftar Perintah:**\n"
+            "• `/start` — Membuka Menu Utama\n"
+            "• `/cek` — Cek rincian metadata lengkap foto\n"
+            "• `/edit` — Edit koordinat GPS dan tanggal/jam foto (Khusus Admin)\n"
+            "• `/bandingkan` — Bandingkan selisih jarak & waktu 2 foto\n"
+            "• `/help` — Bantuan & panduan ini\n"
+            "• `/cancel` — Batalkan proses saat ini\n\n"
+            "⚠️ **Catatan Penting**: Telegram secara default mengompresi foto dan menghapus GPS saat dikirim sebagai foto biasa. Selalu gunakan opsi **'Send as File / Kirim sebagai Dokumen'** untuk hasil terbaik."
+        )
+    else:
+        help_text = (
+            "📖 **PANDUAN & DAFTAR COMMAND BOT**\n\n"
+            "📌 **Daftar Perintah:**\n"
+            "• `/start` — Membuka Menu Utama\n"
+            "• `/cek` — Cek rincian metadata lengkap foto\n"
+            "• `/bandingkan` — Bandingkan selisih jarak & waktu 2 foto\n"
+            "• `/help` — Bantuan & panduan ini\n"
+            "• `/cancel` — Batalkan proses saat ini\n\n"
+            "⚠️ **Catatan Penting**: Telegram secara default mengompresi foto dan menghapus GPS saat dikirim sebagai foto biasa. Selalu gunakan opsi **'Send as File / Kirim sebagai Dokumen'** untuk hasil terbaik."
+        )
+    await update.message.reply_text(help_text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard(user_id))
     return MENU_CHOICE
 
 
@@ -599,10 +655,12 @@ async def handle_check_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lon = meta["lon"]
         buttons.append([InlineKeyboardButton("🗺️ Buka Titik di Google Maps", url=f"https://www.google.com/maps?q={lat:.6f},{lon:.6f}")])
 
-    buttons.append([
-        InlineKeyboardButton("✏️ Edit Foto Ini", callback_data="act_edit_this"),
-        InlineKeyboardButton("📏 Bandingkan Foto", callback_data="act_compare_this")
-    ])
+    action_row = []
+    # Batasi tombol Edit hanya jika User ID diizinkan
+    if is_user_allowed_edit(user_id):
+        action_row.append(InlineKeyboardButton("✏️ Edit Foto Ini", callback_data="act_edit_this"))
+    action_row.append(InlineKeyboardButton("📏 Bandingkan Foto", callback_data="act_compare_this"))
+    buttons.append(action_row)
 
     reply_markup = InlineKeyboardMarkup(buttons)
 
@@ -612,7 +670,7 @@ async def handle_check_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["current_meta"] = meta
 
     await update.message.reply_text(report, parse_mode="Markdown", reply_markup=reply_markup)
-    await update.message.reply_text("💡 Kirim foto lain untuk dicek, atau pilih command di menu popup (**/**):", reply_markup=get_main_menu_keyboard())
+    await update.message.reply_text("💡 Kirim foto lain untuk dicek, atau pilih menu di bawah:", reply_markup=get_main_menu_keyboard(user_id))
     return MENU_CHOICE
 
 
@@ -621,8 +679,12 @@ async def handle_check_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ==========================================
 
 async def handle_edit_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menerima foto untuk diedit."""
+    """Menerima foto untuk diedit (Khusus User ID yang diizinkan)."""
     user_id = update.effective_user.id
+    if not is_user_allowed_edit(user_id):
+        await update.message.reply_text("⛔ Akses ditolak: Fitur Edit Metadata dibatasi untuk admin.", reply_markup=get_main_menu_keyboard(user_id))
+        return MENU_CHOICE
+
     user_dir = os.path.join(TEMP_DIR, f"edit_{user_id}")
     os.makedirs(user_dir, exist_ok=True)
     input_path = os.path.join(user_dir, "input.jpg")
@@ -727,6 +789,7 @@ async def handle_edit_datetime_received(update: Update, context: ContextTypes.DE
     """Menerima input tanggal dan waktu, lalu menginjeksi EXIF."""
     text = update.message.text.strip() if update.message.text else ""
     orig_dt = context.user_data.get("orig_meta", {}).get("datetime_str")
+    user_id = update.effective_user.id
 
     dt_str = None
     if text.startswith("🕒"):
@@ -795,7 +858,7 @@ async def handle_edit_datetime_received(update: Update, context: ContextTypes.DE
         pass
 
     context.user_data.clear()
-    await update.message.reply_text("✨ Selesai! Pilih menu di bawah untuk fitur lainnya:", reply_markup=get_main_menu_keyboard())
+    await update.message.reply_text("✨ Selesai! Pilih menu di bawah untuk fitur lainnya:", reply_markup=get_main_menu_keyboard(user_id))
     return MENU_CHOICE
 
 
@@ -918,7 +981,7 @@ async def handle_compare_photo_2(update: Update, context: ContextTypes.DEFAULT_T
         pass
 
     context.user_data.clear()
-    await update.message.reply_text("💡 Pilih menu di bawah untuk melakukan operasi lainnya:", reply_markup=get_main_menu_keyboard())
+    await update.message.reply_text("💡 Pilih menu di bawah untuk melakukan operasi lainnya:", reply_markup=get_main_menu_keyboard(user_id))
     return MENU_CHOICE
 
 
@@ -934,8 +997,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     data = query.data
     checked_path = context.user_data.get("current_checked_photo")
     meta = context.user_data.get("current_meta", {})
+    user_id = update.effective_user.id
 
     if data == "act_edit_this":
+        if not is_user_allowed_edit(user_id):
+            await query.answer("⛔ Akses Ditolak: Fitur Edit hanya untuk user yang diizinkan.", show_alert=True)
+            return MENU_CHOICE
+
         if not checked_path or not os.path.exists(checked_path):
             await query.message.reply_text("⚠️ Foto sebelumnya sudah kedaluwarsa. Silakan kirimkan foto baru untuk diedit.")
             return MENU_CHOICE
@@ -978,11 +1046,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Membatalkan operasi saat ini dan kembali ke menu utama."""
+    user_id = update.effective_user.id
     user_dir = context.user_data.get("user_dir")
     if user_dir and os.path.exists(user_dir):
         shutil.rmtree(user_dir, ignore_errors=True)
     context.user_data.clear()
-    await update.message.reply_text("❌ Operasi dibatalkan. Kembali ke menu utama.", reply_markup=get_main_menu_keyboard())
+    await update.message.reply_text("❌ Operasi dibatalkan. Kembali ke menu utama.", reply_markup=get_main_menu_keyboard(user_id))
     return MENU_CHOICE
 
 
@@ -1122,7 +1191,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("help", help_command))
 
-    print("[INFO] Bot EXIF & Metadata Foto (3 Fitur + Robust Comparison) siap berjalan...")
+    print("[INFO] Bot EXIF & Metadata Foto (Role Based Access Control) siap berjalan...")
     app.run_polling()
 
 
