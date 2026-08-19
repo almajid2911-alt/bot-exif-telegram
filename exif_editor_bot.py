@@ -471,6 +471,7 @@ async def download_incoming_photo(update: Update, destination_path: str) -> tupl
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler /start & /menu"""
+    context.user_data.clear()
     text = (
         "🤖 **Selamat Datang di Bot EXIF & Metadata Foto!**\n\n"
         "Gunakan tombol menu popup di samping kolom pesan (**/** atau **Menu**) atau pilih opsi di bawah:\n\n"
@@ -484,6 +485,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler perintah popup /cek"""
+    context.user_data.clear()
+    context.user_data["mode"] = "check"
     await update.message.reply_text(
         "🔍 **Mode: Cek Metadata Foto**\n\n"
         "Silakan **kirimkan foto (JPG/JPEG)** sekarang.\n"
@@ -496,6 +499,8 @@ async def cek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler perintah popup /edit"""
+    context.user_data.clear()
+    context.user_data["mode"] = "edit"
     await update.message.reply_text(
         "✏️ **Mode: Edit / Inject Metadata**\n\n"
         "Silakan **kirimkan foto (JPG/JPEG)** yang ingin diedit.\n"
@@ -508,6 +513,8 @@ async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def bandingkan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler perintah popup /bandingkan"""
+    context.user_data.clear()
+    context.user_data["mode"] = "compare_1"
     await update.message.reply_text(
         "📏 **Mode: Bandingkan 2 Foto (Cek Jarak GPS)**\n\n"
         "📸 Silakan kirimkan **FOTO PERTAMA (Foto 1)** sekarang.\n"
@@ -561,6 +568,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_check_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menerima foto pada mode Cek Metadata atau foto langsung di menu utama."""
+    # Robust check: if currently waiting for Photo 2 of comparison, route directly!
+    if context.user_data.get("mode") == "compare_2":
+        return await handle_compare_photo_2(update, context)
+    elif context.user_data.get("mode") == "compare_1":
+        return await handle_compare_photo_1(update, context)
+    elif context.user_data.get("mode") == "edit":
+        return await handle_edit_photo_received(update, context)
+
     user_id = update.effective_user.id
     user_dir = os.path.join(TEMP_DIR, f"check_{user_id}")
     os.makedirs(user_dir, exist_ok=True)
@@ -591,7 +606,7 @@ async def handle_check_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     reply_markup = InlineKeyboardMarkup(buttons)
 
-    # Simpan path sementara jika user ingin langsung edit foto ini
+    # Simpan path sementara jika user ingin langsung edit / bandingkan foto ini
     context.user_data["current_checked_photo"] = input_path
     context.user_data["user_dir"] = user_dir
     context.user_data["current_meta"] = meta
@@ -619,6 +634,7 @@ async def handle_edit_photo_received(update: Update, context: ContextTypes.DEFAU
 
     context.user_data["input_path"] = input_path
     context.user_data["user_dir"] = user_dir
+    context.user_data["mode"] = "editing_in_progress"
 
     # Ekstrak info lama
     meta = extract_full_metadata(input_path)
@@ -803,6 +819,7 @@ async def handle_compare_photo_1(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data["photo1_path"] = photo1_path
     context.user_data["user_dir"] = user_dir
     context.user_data["meta1"] = meta1
+    context.user_data["mode"] = "compare_2"
 
     if not meta1["has_gps"]:
         await update.message.reply_text(
@@ -823,7 +840,9 @@ async def handle_compare_photo_1(update: Update, context: ContextTypes.DEFAULT_T
 
 async def handle_compare_photo_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menerima Foto 2 dan menampilkan perbandingan jarak GPS & waktu."""
-    user_dir = context.user_data.get("user_dir")
+    user_id = update.effective_user.id
+    user_dir = context.user_data.get("user_dir") or os.path.join(TEMP_DIR, f"compare_{user_id}")
+    os.makedirs(user_dir, exist_ok=True)
     photo2_path = os.path.join(user_dir, "photo_2.jpg")
 
     success, is_doc = await download_incoming_photo(update, photo2_path)
@@ -847,7 +866,7 @@ async def handle_compare_photo_2(update: Update, context: ContextTypes.DEFAULT_T
         lines.append("  • GPS: ❌ *(Tidak ada koordinat)*")
     lines.append(f"  • Waktu: `{meta1.get('datetime_str') or '-'}`")
     if meta1.get("model"):
-        lines.append(f"  • Device: `{meta1.get('make', '')} {meta1['model']}`.strip()")
+        lines.append(f"  • Device: `{meta1.get('make', '')} {meta1['model']}`".strip())
 
     lines.append("")
 
@@ -859,7 +878,7 @@ async def handle_compare_photo_2(update: Update, context: ContextTypes.DEFAULT_T
         lines.append("  • GPS: ❌ *(Tidak ada koordinat)*")
     lines.append(f"  • Waktu: `{meta2.get('datetime_str') or '-'}`")
     if meta2.get("model"):
-        lines.append(f"  • Device: `{meta2.get('make', '')} {meta2['model']}`.strip()")
+        lines.append(f"  • Device: `{meta2.get('make', '')} {meta2['model']}`".strip())
 
     lines.append("\n" + "—" * 25 + "\n")
 
@@ -923,6 +942,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         context.user_data["input_path"] = checked_path
         context.user_data["orig_meta"] = meta
+        context.user_data["mode"] = "editing_in_progress"
 
         msg_info = (
             "✏️ **Lanjut Edit Foto Ini**\n\n"
@@ -945,9 +965,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         context.user_data["photo1_path"] = checked_path
         context.user_data["meta1"] = meta
+        context.user_data["mode"] = "compare_2"
 
         await query.message.reply_text(
-            "📸 Foto ini disimpan sebagai **Foto 1**.\n"
+            "📸 Foto ini disimpan sebagai **Foto 1**.\n\n"
             "Sekarang, silakan kirimkan **FOTO KEDUA (Foto 2)** untuk dibandingkan:",
             reply_markup=ReplyKeyboardRemove()
         )
@@ -1001,9 +1022,10 @@ def main():
             CommandHandler("edit", edit_command),
             CommandHandler("bandingkan", bandingkan_command),
             CommandHandler("compare", bandingkan_command),
-            # Direct photo handling: default to metadata inspection
+            # Direct photo handling
             MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_check_photo),
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_choice),
+            CallbackQueryHandler(handle_callback_query),
         ],
         states={
             MENU_CHOICE: [
@@ -1017,6 +1039,7 @@ def main():
                 CommandHandler("compare", bandingkan_command),
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_check_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_choice),
+                CallbackQueryHandler(handle_callback_query),
             ],
             WAITING_CHECK_PHOTO: [
                 CommandHandler("start", start_command),
@@ -1026,6 +1049,7 @@ def main():
                 CommandHandler("edit", edit_command),
                 CommandHandler("bandingkan", bandingkan_command),
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_check_photo),
+                CallbackQueryHandler(handle_callback_query),
             ],
             WAITING_EDIT_PHOTO: [
                 CommandHandler("start", start_command),
@@ -1035,6 +1059,7 @@ def main():
                 CommandHandler("edit", edit_command),
                 CommandHandler("bandingkan", bandingkan_command),
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_edit_photo_received),
+                CallbackQueryHandler(handle_callback_query),
             ],
             WAITING_EDIT_LOCATION: [
                 CommandHandler("start", start_command),
@@ -1044,6 +1069,7 @@ def main():
                 CommandHandler("edit", edit_command),
                 CommandHandler("bandingkan", bandingkan_command),
                 MessageHandler(filters.LOCATION | (filters.TEXT & ~filters.COMMAND), handle_edit_location_received),
+                CallbackQueryHandler(handle_callback_query),
             ],
             WAITING_EDIT_DATETIME: [
                 CommandHandler("start", start_command),
@@ -1053,6 +1079,7 @@ def main():
                 CommandHandler("edit", edit_command),
                 CommandHandler("bandingkan", bandingkan_command),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_datetime_received),
+                CallbackQueryHandler(handle_callback_query),
             ],
             WAITING_COMPARE_PHOTO_1: [
                 CommandHandler("start", start_command),
@@ -1062,6 +1089,7 @@ def main():
                 CommandHandler("edit", edit_command),
                 CommandHandler("bandingkan", bandingkan_command),
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_compare_photo_1),
+                CallbackQueryHandler(handle_callback_query),
             ],
             WAITING_COMPARE_PHOTO_2: [
                 CommandHandler("start", start_command),
@@ -1071,6 +1099,7 @@ def main():
                 CommandHandler("edit", edit_command),
                 CommandHandler("bandingkan", bandingkan_command),
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_compare_photo_2),
+                CallbackQueryHandler(handle_callback_query),
             ],
         },
         fallbacks=[
@@ -1085,7 +1114,7 @@ def main():
             CommandHandler("compare", bandingkan_command),
             CallbackQueryHandler(handle_callback_query),
         ],
-        allow_reentry=True,
+        per_message=False,
     )
 
     app.add_handler(conv_handler)
@@ -1093,7 +1122,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("help", help_command))
 
-    print("[INFO] Bot EXIF & Metadata Foto (3 Fitur + Popup Commands) siap berjalan...")
+    print("[INFO] Bot EXIF & Metadata Foto (3 Fitur + Robust Comparison) siap berjalan...")
     app.run_polling()
 
 
