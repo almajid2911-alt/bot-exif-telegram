@@ -1,5 +1,6 @@
 import os
 import re
+import math
 import shutil
 import logging
 from datetime import datetime, timezone, timedelta
@@ -7,7 +8,14 @@ from dotenv import load_dotenv
 import piexif
 from PIL import Image
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -28,7 +36,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Conversation States
-WAITING_PHOTO, WAITING_LOCATION, WAITING_DATETIME = range(3)
+(
+    MENU_CHOICE,
+    WAITING_EDIT_PHOTO,
+    WAITING_EDIT_LOCATION,
+    WAITING_EDIT_DATETIME,
+    WAITING_CHECK_PHOTO,
+    WAITING_COMPARE_PHOTO_1,
+    WAITING_COMPARE_PHOTO_2,
+) = range(7)
 
 # Directory for temp photo processing
 TEMP_DIR = os.path.join(os.path.dirname(__file__), "temp_photos")
@@ -36,7 +52,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 
 # ==========================================
-# EXIF HELPER FUNCTIONS
+# EXIF & GEOLOCATION HELPER FUNCTIONS
 # ==========================================
 
 def get_now_gmt8():
@@ -67,14 +83,196 @@ def dms_to_decimal(dms, ref):
     except Exception:
         return None
 
+def calculate_haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Menghitung jarak antara dua koordinat GPS (dalam meter) menggunakan formula Haversine."""
+    R = 6371000.0  # Radius bumi dalam meter
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+
+    a = math.sin(delta_phi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * (math.sin(delta_lambda / 2.0) ** 2)
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    return R * c
+
+def format_distance(dist_meters: float) -> str:
+    """Format jarak agar ramah dibaca (meter / kilometer)."""
+    if dist_meters < 1000:
+        return f"{dist_meters:.1f} meter"
+    else:
+        return f"{dist_meters / 1000.0:.3f} km ({dist_meters:,.0f} meter)"
+
+def parse_exif_datetime(dt_str: str):
+    """Parse format standar EXIF YYYY:MM:DD HH:MM:SS ke datetime object jika memungkinkan."""
+    if not dt_str:
+        return None
+    try:
+        clean_str = str(dt_str).strip().replace("/", ":").replace("-", ":")
+        parts = clean_str.split(" ")
+        if len(parts) == 2:
+            y, m, d = map(int, parts[0].split(":"))
+            hh, mm, ss = map(int, parts[1].split(":"))
+            return datetime(y, m, d, hh, mm, ss)
+    except Exception:
+        pass
+    return None
+
+def format_time_difference(dt1: datetime, dt2: datetime) -> str:
+    """Format selisih waktu antara dua tanggal."""
+    if not dt1 or not dt2:
+        return "-"
+    diff = abs(dt1 - dt2)
+    days = diff.days
+    hours, remainder = divmod(diff.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    parts = []
+    if days > 0:
+        parts.append(f"{days} hari")
+    if hours > 0:
+        parts.append(f"{hours} jam")
+    if minutes > 0:
+        parts.append(f"{minutes} menit")
+    if seconds > 0 or not parts:
+        parts.append(f"{seconds} detik")
+    return " ".join(parts)
+
+def extract_full_metadata(image_path: str) -> dict:
+    """Mengekstrak seluruh metadata komprehensif dari file gambar."""
+    meta = {
+        "lat": None,
+        "lon": None,
+        "altitude": None,
+        "datetime_str": None,
+        "datetime_obj": None,
+        "make": None,
+        "model": None,
+        "software": None,
+        "width": None,
+        "height": None,
+        "megapixels": None,
+        "filesize_bytes": 0,
+        "filesize_human": "0 KB",
+        "has_gps": False,
+    }
+
+    if os.path.exists(image_path):
+        sz = os.path.getsize(image_path)
+        meta["filesize_bytes"] = sz
+        if sz >= 1024 * 1024:
+            meta["filesize_human"] = f"{sz / (1024 * 1024):.2f} MB"
+        else:
+            meta["filesize_human"] = f"{sz / 1024:.1f} KB"
+
+    try:
+        with Image.open(image_path) as img:
+            w, h = img.size
+            meta["width"] = w
+            meta["height"] = h
+            meta["megapixels"] = round((w * h) / 1_000_000, 1)
+    except Exception as e:
+        logger.warning(f"Gagal membaca dimensi gambar: {e}")
+
+    try:
+        exif_dict = piexif.load(image_path)
+
+        # GPS IFD
+        gps = exif_dict.get("GPS", {})
+        if piexif.GPSIFD.GPSLatitude in gps and piexif.GPSIFD.GPSLongitude in gps:
+            lat = dms_to_decimal(gps[piexif.GPSIFD.GPSLatitude], gps.get(piexif.GPSIFD.GPSLatitudeRef, 'N'))
+            lon = dms_to_decimal(gps[piexif.GPSIFD.GPSLongitude], gps.get(piexif.GPSIFD.GPSLongitudeRef, 'E'))
+            if lat is not None and lon is not None:
+                meta["lat"] = lat
+                meta["lon"] = lon
+                meta["has_gps"] = True
+
+        if piexif.GPSIFD.GPSAltitude in gps:
+            alt_tuple = gps[piexif.GPSIFD.GPSAltitude]
+            if isinstance(alt_tuple, tuple) and len(alt_tuple) == 2 and alt_tuple[1] != 0:
+                meta["altitude"] = alt_tuple[0] / alt_tuple[1]
+
+        # Datetime
+        dt_raw = (
+            exif_dict.get("Exif", {}).get(piexif.ExifIFD.DateTimeOriginal) or
+            exif_dict.get("Exif", {}).get(piexif.ExifIFD.DateTimeDigitized) or
+            exif_dict.get("0th", {}).get(piexif.ImageIFD.DateTime)
+        )
+        if dt_raw:
+            dt_decoded = dt_raw.decode('utf-8', errors='ignore') if isinstance(dt_raw, bytes) else str(dt_raw)
+            meta["datetime_str"] = dt_decoded
+            meta["datetime_obj"] = parse_exif_datetime(dt_decoded)
+
+        # Device make & model
+        make = exif_dict.get("0th", {}).get(piexif.ImageIFD.Make)
+        if make:
+            meta["make"] = make.decode('utf-8', errors='ignore').strip() if isinstance(make, bytes) else str(make).strip()
+
+        model = exif_dict.get("0th", {}).get(piexif.ImageIFD.Model)
+        if model:
+            meta["model"] = model.decode('utf-8', errors='ignore').strip() if isinstance(model, bytes) else str(model).strip()
+
+        software = exif_dict.get("0th", {}).get(piexif.ImageIFD.Software)
+        if software:
+            meta["software"] = software.decode('utf-8', errors='ignore').strip() if isinstance(software, bytes) else str(software).strip()
+
+    except Exception as e:
+        logger.warning(f"Gagal membaca EXIF detail: {e}")
+
+    return meta
+
+def format_metadata_report(meta: dict, title: str = "📊 HASIL PENGECEKAN METADATA FOTO") -> str:
+    """Membuat format teks laporan metadata foto yang rapi dan detail."""
+    lines = [f"**{title}**\n"]
+
+    # GPS
+    if meta.get("has_gps") and meta.get("lat") is not None and meta.get("lon") is not None:
+        lat = meta["lat"]
+        lon = meta["lon"]
+        lines.append(f"📍 **Koordinat GPS**: `{lat:.6f}, {lon:.6f}`")
+        if meta.get("altitude") is not None:
+            lines.append(f"⛰️ **Ketinggian (Alt)**: `{meta['altitude']:.1f} meter`")
+        lines.append(f"🗺️ **Google Maps**: [Buka di Google Maps](https://www.google.com/maps?q={lat:.6f},{lon:.6f})")
+    else:
+        lines.append("📍 **Koordinat GPS**: ❌ *(Tidak Ada / Foto belum ada geotag)*")
+
+    # Waktu
+    if meta.get("datetime_str"):
+        lines.append(f"📅 **Waktu Pengambilan**: `{meta['datetime_str']}`")
+    else:
+        lines.append("📅 **Waktu Pengambilan**: ❌ *(Tidak ditemukan di EXIF)*")
+
+    # Device
+    device_parts = []
+    if meta.get("make"):
+        device_parts.append(meta["make"])
+    if meta.get("model") and meta["model"] != meta.get("make"):
+        device_parts.append(meta["model"])
+
+    if device_parts:
+        lines.append(f"📱 **Perangkat/Kamera**: `{' '.join(device_parts)}`")
+
+    if meta.get("software"):
+        lines.append(f"⚙️ **Software/Aplikasi**: `{meta['software']}`")
+
+    # Dimensi & Ukuran File
+    if meta.get("width") and meta.get("height"):
+        mp_str = f" ({meta['megapixels']} MP)" if meta.get("megapixels") else ""
+        lines.append(f"📐 **Resolusi**: `{meta['width']} x {meta['height']}{mp_str}`")
+
+    if meta.get("filesize_human"):
+        lines.append(f"💾 **Ukuran File**: `{meta['filesize_human']}`")
+
+    return "\n".join(lines)
+
+
 def convert_to_exif_gps(lat: float, lon: float, dt_obj: datetime = None):
     """Membuat dictionary EXIF GPS IFD komplit dari latitude, longitude, dan waktu."""
     lat_deg, lat_min, lat_sec = decimal_to_dms(lat)
     lon_deg, lon_min, lon_sec = decimal_to_dms(lon)
-    
+
     lat_ref = 'N' if lat >= 0 else 'S'
     lon_ref = 'E' if lon >= 0 else 'W'
-    
+
     gps_ifd = {
         piexif.GPSIFD.GPSVersionID: (2, 2, 0, 0),
         piexif.GPSIFD.GPSLatitudeRef: lat_ref.encode('ascii'),
@@ -99,7 +297,7 @@ def convert_to_exif_gps(lat: float, lon: float, dt_obj: datetime = None):
         tz_gmt8 = timezone(timedelta(hours=8))
         dt_local = dt_obj.replace(tzinfo=tz_gmt8)
         dt_utc = dt_local.astimezone(timezone.utc)
-        
+
         gps_ifd[piexif.GPSIFD.GPSDateStamp] = dt_utc.strftime("%Y:%m:%d").encode('ascii')
         gps_ifd[piexif.GPSIFD.GPSTimeStamp] = (
             (dt_utc.hour, 1),
@@ -129,7 +327,6 @@ def build_xmp_segment(lat: float, lon: float, dt_obj: datetime, tz_offset: str =
         f' </rdf:RDF>'
         f'</x:xmpmeta>'
     )
-    # Add standard padding (2KB) so XMP can be edited in-place without rewriting the file
     padding = ' ' * 2048
     xmp_xml += padding + '<?xpacket end="w"?>'
 
@@ -139,30 +336,8 @@ def build_xmp_segment(lat: float, lon: float, dt_obj: datetime, tz_offset: str =
     segment = b"\xff\xe1" + segment_len.to_bytes(2, "big") + payload
     return segment
 
-
-def extract_exif_info(image_path: str):
-    """Membaca koordinat dan tanggal/waktu yang sudah ada di foto jika ada."""
-    info = {"lat": None, "lon": None, "datetime": None}
-    try:
-        exif_dict = piexif.load(image_path)
-        gps = exif_dict.get("GPS", {})
-        if piexif.GPSIFD.GPSLatitude in gps and piexif.GPSIFD.GPSLongitude in gps:
-            lat = dms_to_decimal(gps[piexif.GPSIFD.GPSLatitude], gps.get(piexif.GPSIFD.GPSLatitudeRef, 'N'))
-            lon = dms_to_decimal(gps[piexif.GPSIFD.GPSLongitude], gps.get(piexif.GPSIFD.GPSLongitudeRef, 'E'))
-            info["lat"] = lat
-            info["lon"] = lon
-
-        dt_orig = exif_dict.get("Exif", {}).get(piexif.ExifIFD.DateTimeOriginal) or \
-                  exif_dict.get("0th", {}).get(piexif.ImageIFD.DateTime)
-        if dt_orig:
-            info["datetime"] = dt_orig.decode('utf-8')
-    except Exception as e:
-        logger.warning(f"Gagal membaca EXIF awal: {e}")
-    return info
-
 def update_photo_exif(image_path: str, output_path: str, lat: float = None, lon: float = None, datetime_str: str = None, tz_offset: str = "+08:00"):
     """Memperbarui metadata EXIF + XMP komplit tanpa kompresi ulang gambar."""
-    # Parse tanggal/waktu ke datetime object
     if datetime_str:
         clean_dt = datetime_str.replace("/", "-").replace(":", "-").strip()
         match = re.search(r'(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2})-(\d{1,2})-(\d{1,2})', clean_dt)
@@ -176,17 +351,14 @@ def update_photo_exif(image_path: str, output_path: str, lat: float = None, lon:
 
     dt_exif_str = dt_obj.strftime("%Y:%m:%d %H:%M:%S")
 
-    # Load EXIF lama atau buat baru
     try:
         exif_dict = piexif.load(image_path)
     except Exception:
         exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
 
-    # Update GPS IFD
     if lat is not None and lon is not None:
         exif_dict["GPS"] = convert_to_exif_gps(lat, lon, dt_obj)
 
-    # Update 0th IFD & Exif IFD
     exif_dict["0th"][piexif.ImageIFD.DateTime] = dt_exif_str.encode('utf-8')
     if piexif.ImageIFD.Software not in exif_dict["0th"]:
         exif_dict["0th"][piexif.ImageIFD.Software] = b"Timestamp Camera"
@@ -199,10 +371,10 @@ def update_photo_exif(image_path: str, output_path: str, lat: float = None, lon:
 
     exif_bytes = piexif.dump(exif_dict)
 
-    # 1. Gunakan piexif.insert untuk memperbarui EXIF segmen tanpa kompresi ulang gambar
+    # Injeksi EXIF
     piexif.insert(exif_bytes, image_path, output_path)
 
-    # 2. Baca file hasil dan selipkan segmen APP1 XMP
+    # Injeksi XMP segmen
     with open(output_path, "rb") as f:
         data_with_exif = f.read()
 
@@ -216,16 +388,16 @@ def update_photo_exif(image_path: str, output_path: str, lat: float = None, lon:
         if data_with_exif.startswith(b"\xff\xd8"):
             cleaned_bytes.extend(b"\xff\xd8")
             idx = 2
-        
+
         while idx < length:
-            if data_with_exif[idx:idx+2] == b"\xff\xe1":
-                seg_len = int.from_bytes(data_with_exif[idx+2:idx+4], "big")
-                seg_body = data_with_exif[idx+4 : idx+2+seg_len]
+            if data_with_exif[idx:idx + 2] == b"\xff\xe1":
+                seg_len = int.from_bytes(data_with_exif[idx + 2 : idx + 4], "big")
+                seg_body = data_with_exif[idx + 4 : idx + 2 + seg_len]
                 if seg_body.startswith(b"http://ns.adobe.com/xap/1.0/\x00"):
                     idx += 2 + seg_len
                     continue
                 else:
-                    cleaned_bytes.extend(data_with_exif[idx : idx+2+seg_len])
+                    cleaned_bytes.extend(data_with_exif[idx : idx + 2 + seg_len])
                     idx += 2 + seg_len
             else:
                 cleaned_bytes.extend(data_with_exif[idx:])
@@ -235,7 +407,7 @@ def update_photo_exif(image_path: str, output_path: str, lat: float = None, lon:
         if exif_pos != -1:
             seg_start = cleaned_bytes.rfind(b"\xff\xe1", 0, exif_pos)
             if seg_start != -1:
-                exif_seg_len = int.from_bytes(cleaned_bytes[seg_start+2 : seg_start+4], "big")
+                exif_seg_len = int.from_bytes(cleaned_bytes[seg_start + 2 : seg_start + 4], "big")
                 insert_pos = seg_start + 2 + exif_seg_len
             else:
                 insert_pos = 2
@@ -248,76 +420,196 @@ def update_photo_exif(image_path: str, output_path: str, lat: float = None, lon:
             f.write(final_bytes)
 
 
-
 # ==========================================
-# TELEGRAM BOT HANDLERS
+# TELEGRAM BOT HANDLERS & MENUS
 # ==========================================
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Perintah /start"""
-    text = (
-        "📸 **Selamat Datang di Bot EXIF Photo Editor!**\n\n"
-        "Bot ini membantu Anda mengedit metadata **Koordinat Lokasi GPS** & **Tanggal/Waktu** pada foto.\n\n"
-        "⚠️ **Tips Penting**: Kirimkan foto sebagai **File / Dokumen (Uncompressed)** agar metadata foto tidak terhapus oleh kompresi Telegram.\n\n"
-        "Silakan **kirimkan foto (JPG/JPEG)** sekarang untuk mulai!"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
-    return WAITING_PHOTO
+def get_main_menu_keyboard():
+    """Keyboard menu utama."""
+    keyboard = [
+        ["🔍 Cek Metadata Foto", "✏️ Edit / Inject Metadata"],
+        ["📏 Bandingkan 2 Foto (Cek Jarak GPS)"],
+        ["❓ Bantuan / Panduan"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-async def handle_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menerima foto (baik dokumen maupun photo compressed)"""
-    user_id = update.effective_user.id
-    user_dir = os.path.join(TEMP_DIR, str(user_id))
-    os.makedirs(user_dir, exist_ok=True)
-    input_path = os.path.join(user_dir, "input.jpg")
-
+async def download_incoming_photo(update: Update, destination_path: str) -> tuple[bool, bool]:
+    """Helper untuk mengunduh foto yang dikirim user (baik dokumen atau photo)."""
     is_document = False
     if update.message.document:
         doc = update.message.document
         if not (doc.mime_type and doc.mime_type.startswith("image/")):
-            await update.message.reply_text("❌ File yang dikirim bukan format gambar. Kirim foto berformat JPG/JPEG.")
-            return WAITING_PHOTO
+            return False, False
         file_obj = await doc.get_file()
-        await file_obj.download_to_drive(input_path)
+        await file_obj.download_to_drive(destination_path)
         is_document = True
+        return True, is_document
     elif update.message.photo:
-        # Foto berukuran paling besar
         photo_obj = update.message.photo[-1]
         file_obj = await photo_obj.get_file()
-        await file_obj.download_to_drive(input_path)
+        await file_obj.download_to_drive(destination_path)
+        return True, False
+    return False, False
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler /start & /menu"""
+    text = (
+        "🤖 **Selamat Datang di Bot EXIF & Metadata Foto!**\n\n"
+        "Silakan pilih menu yang ingin digunakan:\n\n"
+        "1️⃣ **🔍 Cek Metadata Foto**: Lihat koordinat GPS, link Google Maps, waktu, tipe HP & resolusi.\n"
+        "2️⃣ **✏️ Edit / Inject Metadata**: Ubah/isi koordinat lokasi GPS dan tanggal/jam foto.\n"
+        "3️⃣ **📏 Bandingkan 2 Foto**: Hitung selisih jarak koordinat GPS (meter/km) & selisih waktu 2 foto.\n\n"
+        "💡 *Tips: Kamu juga bisa langsung kirim foto sekarang untuk langsung mengecek metadatanya.*"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
+    return MENU_CHOICE
+
+async def handle_menu_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mengarahkan pilihan menu utama."""
+    text = update.message.text.strip() if update.message.text else ""
+
+    if "Cek Metadata" in text or text.startswith("1"):
+        await update.message.reply_text(
+            "🔍 **Mode: Cek Metadata Foto**\n\n"
+            "Silakan **kirimkan foto (JPG/JPEG)** sekarang.\n"
+            "⚠️ Disarankan kirim sebagai **File/Dokumen** agar metadata tidak terhapus kompresi Telegram.\n\n"
+            "Ketik /cancel untuk kembali ke Menu Utama.",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return WAITING_CHECK_PHOTO
+
+    elif "Edit" in text or "Inject" in text or text.startswith("2"):
+        await update.message.reply_text(
+            "✏️ **Mode: Edit / Inject Metadata**\n\n"
+            "Silakan **kirimkan foto (JPG/JPEG)** yang ingin diedit.\n"
+            "⚠️ Kirim sebagai **File/Dokumen** agar kualitas & EXIF asli terjaga.\n\n"
+            "Ketik /cancel untuk kembali ke Menu Utama.",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return WAITING_EDIT_PHOTO
+
+    elif "Bandingkan" in text or "Jarak" in text or text.startswith("3"):
+        await update.message.reply_text(
+            "📏 **Mode: Bandingkan 2 Foto (Cek Jarak GPS)**\n\n"
+            "📸 Silakan kirimkan **FOTO PERTAMA (Foto 1)** sekarang.\n"
+            "⚠️ Kirim sebagai **File/Dokumen** agar metadata GPS terbaca akurat.\n\n"
+            "Ketik /cancel untuk membatalkan.",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return WAITING_COMPARE_PHOTO_1
+
+    elif "Bantuan" in text or "Panduan" in text:
+        help_text = (
+            "📖 **PANDUAN PENGGUNAAN BOT**\n\n"
+            "1. **Cek Metadata**: Kirim foto, bot akan menampilkan koordinat GPS, Maps, perangkat, waktu & resolusi.\n"
+            "2. **Edit Metadata**: Ubah titik koordinat (Share Location / teks koordinat) dan tanggal/jam pada foto.\n"
+            "3. **Bandingkan 2 Foto**: Kirim 2 foto, bot akan menghitung selisih jarak fisik (meter/km) & selisih waktu pengambilan kedua foto.\n\n"
+            "⚠️ **Catatan Penting**: Telegram secara default mengompresi gambar dan menghapus metadata GPS saat dikirim sebagai 'Photo biasa'. Selalu gunakan opsi **'Send as File / Kirim sebagai Dokumen'** untuk menjaga data EXIF."
+        )
+        await update.message.reply_text(help_text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
+        return MENU_CHOICE
+
     else:
-        await update.message.reply_text("Silakan kirimkan foto JPG/JPEG sebagai File/Dokumen atau Gambar.")
-        return WAITING_PHOTO
+        # Jika bukan tombol menu, arahkan kembali
+        await update.message.reply_text("Silakan pilih menu dari tombol di bawah atau kirimkan foto:", reply_markup=get_main_menu_keyboard())
+        return MENU_CHOICE
+
+
+# ==========================================
+# 1. CEK METADATA FLOW
+# ==========================================
+
+async def handle_check_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menerima foto pada mode Cek Metadata atau foto langsung di menu utama."""
+    user_id = update.effective_user.id
+    user_dir = os.path.join(TEMP_DIR, f"check_{user_id}")
+    os.makedirs(user_dir, exist_ok=True)
+    input_path = os.path.join(user_dir, "check_input.jpg")
+
+    success, is_doc = await download_incoming_photo(update, input_path)
+    if not success:
+        await update.message.reply_text("❌ File bukan format gambar. Silakan kirimkan foto JPG/JPEG sebagai File/Dokumen atau Gambar.")
+        return WAITING_CHECK_PHOTO
+
+    meta = extract_full_metadata(input_path)
+    report = format_metadata_report(meta)
+
+    if not is_doc:
+        report += "\n\n⚠️ *Perhatian*: Foto dikirim sebagai gambar biasa (kompresi Telegram dapat menghapus tag EXIF). Kirim sebagai *Dokumen/File* untuk data asli."
+
+    # Tombol aksi interaktif
+    buttons = []
+    if meta.get("has_gps"):
+        lat = meta["lat"]
+        lon = meta["lon"]
+        buttons.append([InlineKeyboardButton("🗺️ Buka Titik di Google Maps", url=f"https://www.google.com/maps?q={lat:.6f},{lon:.6f}")])
+
+    buttons.append([
+        InlineKeyboardButton("✏️ Edit Foto Ini", callback_data="act_edit_this"),
+        InlineKeyboardButton("📏 Bandingkan Foto", callback_data="act_compare_this")
+    ])
+
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    # Simpan path sementara jika user ingin langsung edit foto ini
+    context.user_data["current_checked_photo"] = input_path
+    context.user_data["user_dir"] = user_dir
+    context.user_data["current_meta"] = meta
+
+    await update.message.reply_text(report, parse_mode="Markdown", reply_markup=reply_markup)
+    await update.message.reply_text("💡 Kirim foto lain untuk dicek, atau pilih menu di bawah:", reply_markup=get_main_menu_keyboard())
+    return MENU_CHOICE
+
+
+# ==========================================
+# 2. EDIT / INJECT METADATA FLOW
+# ==========================================
+
+async def handle_edit_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menerima foto untuk diedit."""
+    user_id = update.effective_user.id
+    user_dir = os.path.join(TEMP_DIR, f"edit_{user_id}")
+    os.makedirs(user_dir, exist_ok=True)
+    input_path = os.path.join(user_dir, "input.jpg")
+
+    success, is_doc = await download_incoming_photo(update, input_path)
+    if not success:
+        await update.message.reply_text("❌ File bukan format gambar. Silakan kirimkan foto JPG/JPEG.")
+        return WAITING_EDIT_PHOTO
 
     context.user_data["input_path"] = input_path
     context.user_data["user_dir"] = user_dir
 
-    # Cek metadata yang ada saat ini
-    exif_info = extract_exif_info(input_path)
-    context.user_data["orig_info"] = exif_info
+    # Ekstrak info lama
+    meta = extract_full_metadata(input_path)
+    context.user_data["orig_meta"] = meta
 
     msg_info = ""
-    if not is_document:
-        msg_info += "⚠️ *Catatan*: Foto dikirim sebagai gambar biasa (bisa terkena kompresi). Disarankan menggunakan opsi *Send as File/Document*.\n\n"
+    if not is_doc:
+        msg_info += "⚠️ *Catatan*: Foto dikirim sebagai gambar biasa (bisa terkompresi). Disarankan kirim sebagai *File/Dokumen*.\n\n"
 
     msg_info += "📥 **Foto Berhasil Diterima!**\n"
-    if exif_info["lat"] is not None:
-        msg_info += f"📍 Lokasi Terdeteksi: `{exif_info['lat']:.6f}, {exif_info['lon']:.6f}`\n"
+    if meta["has_gps"]:
+        msg_info += f"📍 Lokasi Asli: `{meta['lat']:.6f}, {meta['lon']:.6f}`\n"
     else:
-        msg_info += "📍 Lokasi Terdeteksi: *(Belum Ada)*\n"
+        msg_info += "📍 Lokasi Asli: *(Belum Ada Geotag)*\n"
 
-    if exif_info["datetime"]:
-        msg_info += f"📅 Waktu Terdeteksi: `{exif_info['datetime']}`\n\n"
+    if meta["datetime_str"]:
+        msg_info += f"📅 Waktu Asli: `{meta['datetime_str']}`\n\n"
     else:
-        msg_info += "📅 Waktu Terdeteksi: *(Belum Ada)*\n\n"
+        msg_info += "📅 Waktu Asli: *(Belum Ada di EXIF)*\n\n"
 
     msg_info += (
         "📍 **Langkah 1: Tentukan Lokasi Baru**\n"
-        "• Kirim **Pin Lokasi** via fitur Share Location Telegram 📍\n"
+        "• Kirim **Pin Lokasi** via Share Location Telegram 📍\n"
         "• Atau **Ketik Koordinat** teks, contoh: `-3.3194, 114.5908`\n"
+        "• Atau ketik /cancel untuk membatalkan."
     )
 
-    # Keyboard opsi untuk lokasi
     keyboard = [
         [KeyboardButton("📍 Kirim Lokasi Saat Ini (GPS HP)", request_location=True)],
         ["⏭️ Pakai Lokasi Foto Lama / Skip Lokasi"]
@@ -325,10 +617,10 @@ async def handle_photo_received(update: Update, context: ContextTypes.DEFAULT_TY
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
 
     await update.message.reply_text(msg_info, parse_mode="Markdown", reply_markup=reply_markup)
-    return WAITING_LOCATION
+    return WAITING_EDIT_LOCATION
 
-async def handle_location_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menerima input lokasi (Location object dari Telegram atau teks koordinat desimal)"""
+async def handle_edit_location_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menerima input lokasi baru."""
     lat, lon = None, None
 
     if update.message.location:
@@ -337,12 +629,10 @@ async def handle_location_received(update: Update, context: ContextTypes.DEFAULT
     elif update.message.text:
         text = update.message.text.strip()
         if text.startswith("⏭️"):
-            # Skip lokasi, gunakan yang lama jika ada
-            orig = context.user_data.get("orig_info", {})
+            orig = context.user_data.get("orig_meta", {})
             lat = orig.get("lat")
             lon = orig.get("lon")
         else:
-            # Parse koordinat teks desimal: e.g. "-3.3194, 114.5908" or "-3.3194 114.5908"
             match = re.search(r'([-+]?\d+\.\d+)[,\s]+([-+]?\d+\.\d+)', text)
             if match:
                 try:
@@ -356,12 +646,11 @@ async def handle_location_received(update: Update, context: ContextTypes.DEFAULT
             "❌ Format koordinat tidak dikenali.\n"
             "Kirimkan **Pin Lokasi** atau ketik format desimal seperti: `-3.3194, 114.5908`"
         )
-        return WAITING_LOCATION
+        return WAITING_EDIT_LOCATION
 
     context.user_data["new_lat"] = lat
     context.user_data["new_lon"] = lon
 
-    # Lanjut ke Waktu/Tanggal
     now_gmt8 = get_now_gmt8()
     now_str = now_gmt8.strftime("%Y-%m-%d %H:%M:%S")
     msg_dt = (
@@ -377,28 +666,23 @@ async def handle_location_received(update: Update, context: ContextTypes.DEFAULT
         [f"🕒 Gunakan Waktu Sekarang ({now_str})"],
         ["⏭️ Pakai Waktu Foto Lama / Skip Waktu"]
     ]
-
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
 
     await update.message.reply_text(msg_dt, parse_mode="Markdown", reply_markup=reply_markup)
-    return WAITING_DATETIME
+    return WAITING_EDIT_DATETIME
 
-async def handle_datetime_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menerima input tanggal dan waktu"""
+async def handle_edit_datetime_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menerima input tanggal dan waktu, lalu menginjeksi EXIF."""
     text = update.message.text.strip() if update.message.text else ""
-    orig_dt = context.user_data.get("orig_info", {}).get("datetime")
-    
+    orig_dt = context.user_data.get("orig_meta", {}).get("datetime_str")
+
     dt_str = None
     if text.startswith("🕒"):
         dt_str = get_now_gmt8().strftime("%Y-%m-%d %H:%M:%S")
     elif text.startswith("⏭️"):
         dt_str = orig_dt or get_now_gmt8().strftime("%Y-%m-%d %H:%M:%S")
     else:
-        # Coba validasi teks tanggal yang diketik user
         try:
-            # Mengganti karakter pemisah agar mudah diparse
-            clean_text = text.replace("/", "-").replace(":", "-")
-            # Ex: 2026-08-15-14-30-00 or 2026-08-15 14:30:00
             match = re.search(r'(\d{4})[-:](\d{1,2})[-:](\d{1,2})\s+(\d{1,2})[-:](\d{1,2})[-:](\d{1,2})', text)
             if match:
                 y, m, d, hh, mm, ss = match.groups()
@@ -414,15 +698,14 @@ async def handle_datetime_received(update: Update, context: ContextTypes.DEFAULT
     if not dt_str:
         await update.message.reply_text(
             "❌ Format tanggal/waktu tidak valid.\n"
-            "Gunakan format: `YYYY-MM-DD HH:MM:SS` (Contoh: `2026-08-15 14:30:00`) atau tekan tombol di bawah.",
+            "Gunakan format: `YYYY-MM-DD HH:MM:SS` (Contoh: `2026-08-19 14:30:00`) atau tekan tombol di bawah.",
             parse_mode="Markdown"
         )
-        return WAITING_DATETIME
+        return WAITING_EDIT_DATETIME
 
-    # Jalankan pengubahan EXIF
     input_path = context.user_data["input_path"]
     user_dir = context.user_data["user_dir"]
-    output_path = os.path.join(user_dir, "output_exif.jpg")
+    output_path = os.path.join(user_dir, "photo_edited_exif.jpg")
     lat = context.user_data["new_lat"]
     lon = context.user_data["new_lon"]
 
@@ -434,6 +717,7 @@ async def handle_datetime_received(update: Update, context: ContextTypes.DEFAULT
         caption = (
             "✅ **Metadata Foto Berhasil Diperbarui!**\n\n"
             f"📍 **Koordinat**: `{lat:.6f}, {lon:.6f}`\n"
+            f"🗺️ **Maps**: [Buka di Google Maps](https://www.google.com/maps?q={lat:.6f},{lon:.6f})\n"
             f"📅 **Waktu**: `{dt_str}`\n\n"
             "📁 *File dikirim sebagai Dokumen agar metadata EXIF tetap utuh.*"
         )
@@ -453,6 +737,125 @@ async def handle_datetime_received(update: Update, context: ContextTypes.DEFAULT
         logger.error(f"Gagal memproses foto: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Terjadi kesalahan saat memproses EXIF: {e}")
 
+    try:
+        shutil.rmtree(user_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    context.user_data.clear()
+    await update.message.reply_text("✨ Selesai! Pilih menu di bawah untuk fitur lainnya:", reply_markup=get_main_menu_keyboard())
+    return MENU_CHOICE
+
+
+# ==========================================
+# 3. BANDINGKAN 2 FOTO (JARAK GPS & WAKTU)
+# ==========================================
+
+async def handle_compare_photo_1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menerima Foto 1 untuk komparasi jarak."""
+    user_id = update.effective_user.id
+    user_dir = os.path.join(TEMP_DIR, f"compare_{user_id}")
+    os.makedirs(user_dir, exist_ok=True)
+    photo1_path = os.path.join(user_dir, "photo_1.jpg")
+
+    success, is_doc = await download_incoming_photo(update, photo1_path)
+    if not success:
+        await update.message.reply_text("❌ File bukan gambar. Kirimkan **Foto 1** berformat JPG/JPEG.")
+        return WAITING_COMPARE_PHOTO_1
+
+    meta1 = extract_full_metadata(photo1_path)
+    context.user_data["photo1_path"] = photo1_path
+    context.user_data["user_dir"] = user_dir
+    context.user_data["meta1"] = meta1
+
+    if not meta1["has_gps"]:
+        await update.message.reply_text(
+            "⚠️ **Peringatan**: Foto 1 tidak memiliki tag koordinat GPS!\n"
+            "Pastikan foto diambil dengan GPS aktif dan dikirim sebagai **File/Dokumen**.\n\n"
+            "Tetap ingin lanjut? Silakan kirimkan **FOTO KEDUA (Foto 2)** sekarang."
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ **Foto 1 Berhasil Diterima!**\n"
+            f"📍 Koordinat Foto 1: `{meta1['lat']:.6f}, {meta1['lon']:.6f}`\n"
+            f"📅 Waktu Foto 1: `{meta1['datetime_str'] or '-'}`\n\n"
+            "📸 Sekarang, silakan kirimkan **FOTO KEDUA (Foto 2)** untuk dibandingkan:",
+            parse_mode="Markdown"
+        )
+
+    return WAITING_COMPARE_PHOTO_2
+
+async def handle_compare_photo_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menerima Foto 2 dan menampilkan perbandingan jarak GPS & waktu."""
+    user_dir = context.user_data.get("user_dir")
+    photo2_path = os.path.join(user_dir, "photo_2.jpg")
+
+    success, is_doc = await download_incoming_photo(update, photo2_path)
+    if not success:
+        await update.message.reply_text("❌ File bukan gambar. Kirimkan **Foto 2** berformat JPG/JPEG.")
+        return WAITING_COMPARE_PHOTO_2
+
+    meta1 = context.user_data.get("meta1", {})
+    meta2 = extract_full_metadata(photo2_path)
+
+    has_gps1 = meta1.get("has_gps", False)
+    has_gps2 = meta2.get("has_gps", False)
+
+    lines = ["📊 **HASIL PERBANDINGAN 2 FOTO**\n"]
+
+    # Rincian Foto 1
+    lines.append("🔹 **Foto 1 (Asal)**:")
+    if has_gps1:
+        lines.append(f"  • GPS: `{meta1['lat']:.6f}, {meta1['lon']:.6f}`")
+    else:
+        lines.append("  • GPS: ❌ *(Tidak ada koordinat)*")
+    lines.append(f"  • Waktu: `{meta1.get('datetime_str') or '-'}`")
+    if meta1.get("model"):
+        lines.append(f"  • Device: `{meta1.get('make', '')} {meta1['model']}`.strip()")
+
+    lines.append("")
+
+    # Rincian Foto 2
+    lines.append("🔹 **Foto 2 (Tujuan / Pembanding)**:")
+    if has_gps2:
+        lines.append(f"  • GPS: `{meta2['lat']:.6f}, {meta2['lon']:.6f}`")
+    else:
+        lines.append("  • GPS: ❌ *(Tidak ada koordinat)*")
+    lines.append(f"  • Waktu: `{meta2.get('datetime_str') or '-'}`")
+    if meta2.get("model"):
+        lines.append(f"  • Device: `{meta2.get('make', '')} {meta2['model']}`.strip()")
+
+    lines.append("\n" + "—" * 25 + "\n")
+
+    # Kalkulasi Selisih Jarak & Waktu
+    buttons = []
+    if has_gps1 and has_gps2:
+        dist_m = calculate_haversine_distance(meta1["lat"], meta1["lon"], meta2["lat"], meta2["lon"])
+        dist_formatted = format_distance(dist_m)
+        lines.append(f"📏 **Selisih Jarak GPS**: **`{dist_formatted}`**")
+
+        # Evaluasi radius praktis
+        if dist_m <= 15:
+            lines.append("🟢 *Status: Lokasi SANGAT IDENTIK / Titik Sama (<= 15 meter)*")
+        elif dist_m <= 100:
+            lines.append("🟡 *Status: Lokasi Berdekatan / Area Sama (<= 100 meter)*")
+        else:
+            lines.append("🔴 *Status: Lokasi Berjauhan (> 100 meter)*")
+
+        route_url = f"https://www.google.com/maps/dir/?api=1&origin={meta1['lat']:.6f},{meta1['lon']:.6f}&destination={meta2['lat']:.6f},{meta2['lon']:.6f}"
+        buttons.append([InlineKeyboardButton("🗺️ Lihat Rute Antar Foto di Google Maps", url=route_url)])
+    else:
+        lines.append("⚠️ **Jarak GPS Tidak Dapat Dihitung**: Salah satu atau kedua foto tidak memiliki tag koordinat GPS.")
+
+    # Selisih waktu
+    if meta1.get("datetime_obj") and meta2.get("datetime_obj"):
+        time_diff = format_time_difference(meta1["datetime_obj"], meta2["datetime_obj"])
+        lines.append(f"⏱️ **Selisih Waktu Pengambilan**: `{time_diff}`")
+
+    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=reply_markup)
+
     # Cleanup temp
     try:
         shutil.rmtree(user_dir, ignore_errors=True)
@@ -460,21 +863,74 @@ async def handle_datetime_received(update: Update, context: ContextTypes.DEFAULT
         pass
 
     context.user_data.clear()
-    await update.message.reply_text("💡 Kirimkan foto lagi kapan saja untuk mengedit foto berikutnya! /start")
-    return ConversationHandler.END
+    await update.message.reply_text("💡 Pilih menu di bawah untuk melakukan operasi lainnya:", reply_markup=get_main_menu_keyboard())
+    return MENU_CHOICE
+
+
+# ==========================================
+# CALLBACK QUERY & UNIVERSAL HANDLERS
+# ==========================================
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menangani tombol inline callback."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    checked_path = context.user_data.get("current_checked_photo")
+    meta = context.user_data.get("current_meta", {})
+
+    if data == "act_edit_this":
+        if not checked_path or not os.path.exists(checked_path):
+            await query.message.reply_text("⚠️ Foto sebelumnya sudah kedaluwarsa. Silakan kirimkan foto baru untuk diedit.")
+            return MENU_CHOICE
+
+        context.user_data["input_path"] = checked_path
+        context.user_data["orig_meta"] = meta
+
+        msg_info = (
+            "✏️ **Lanjut Edit Foto Ini**\n\n"
+            "📍 **Langkah 1: Tentukan Lokasi Baru**\n"
+            "• Kirim **Pin Lokasi** via Share Location Telegram 📍\n"
+            "• Atau **Ketik Koordinat** teks, contoh: `-3.3194, 114.5908`\n"
+        )
+        keyboard = [
+            [KeyboardButton("📍 Kirim Lokasi Saat Ini (GPS HP)", request_location=True)],
+            ["⏭️ Pakai Lokasi Foto Lama / Skip Lokasi"]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        await query.message.reply_text(msg_info, parse_mode="Markdown", reply_markup=reply_markup)
+        return WAITING_EDIT_LOCATION
+
+    elif data == "act_compare_this":
+        if not checked_path or not os.path.exists(checked_path):
+            await query.message.reply_text("⚠️ Foto sebelumnya sudah kedaluwarsa. Silakan pilih menu Bandingkan 2 Foto dari menu utama.")
+            return MENU_CHOICE
+
+        context.user_data["photo1_path"] = checked_path
+        context.user_data["meta1"] = meta
+
+        await query.message.reply_text(
+            "📸 Foto ini disimpan sebagai **Foto 1**.\n"
+            "Sekarang, silakan kirimkan **FOTO KEDUA (Foto 2)** untuk dibandingkan:",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return WAITING_COMPARE_PHOTO_2
+
+    return MENU_CHOICE
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Membatalkan proses"""
+    """Membatalkan operasi saat ini dan kembali ke menu utama."""
     user_dir = context.user_data.get("user_dir")
     if user_dir and os.path.exists(user_dir):
         shutil.rmtree(user_dir, ignore_errors=True)
     context.user_data.clear()
-    await update.message.reply_text("❌ Proses dibatalkan. Kirim /start untuk mulai kembali.", reply_markup=ReplyKeyboardRemove())
-    return ConversationHandler.END
+    await update.message.reply_text("❌ Operasi dibatalkan. Kembali ke menu utama.", reply_markup=get_main_menu_keyboard())
+    return MENU_CHOICE
 
 
 # ==========================================
-# MAIN FUNCTION
+# MAIN FUNCTION & BOT RUNNER
 # ==========================================
 
 import sys
@@ -482,10 +938,10 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 def main():
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        print("="*60)
+        print("=" * 60)
         print("ERROR: TELEGRAM_BOT_TOKEN belum diset di file .env!")
         print("Silakan buka file .env dan masukkan Token dari @BotFather.")
-        print("="*60)
+        print("=" * 60)
         return
 
     app = (
@@ -501,34 +957,54 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start_command),
+            CommandHandler("menu", start_command),
             CommandHandler("help", start_command),
-            MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo_received)
+            # Direct photo handling: default to metadata inspection
+            MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_check_photo),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_choice),
         ],
         states={
-            WAITING_PHOTO: [
-                MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo_received)
+            MENU_CHOICE: [
+                CommandHandler("start", start_command),
+                CommandHandler("menu", start_command),
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_check_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_choice),
             ],
-            WAITING_LOCATION: [
-                MessageHandler(filters.LOCATION | filters.TEXT & ~filters.COMMAND, handle_location_received)
+            WAITING_CHECK_PHOTO: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_check_photo),
             ],
-            WAITING_DATETIME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_datetime_received)
+            WAITING_EDIT_PHOTO: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_edit_photo_received),
+            ],
+            WAITING_EDIT_LOCATION: [
+                MessageHandler(filters.LOCATION | (filters.TEXT & ~filters.COMMAND), handle_edit_location_received),
+            ],
+            WAITING_EDIT_DATETIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_datetime_received),
+            ],
+            WAITING_COMPARE_PHOTO_1: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_compare_photo_1),
+            ],
+            WAITING_COMPARE_PHOTO_2: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_compare_photo_2),
             ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel_command),
             CommandHandler("start", start_command),
+            CommandHandler("menu", start_command),
             CommandHandler("help", start_command),
+            CallbackQueryHandler(handle_callback_query),
         ],
+        allow_reentry=True,
     )
 
-
     app.add_handler(conv_handler)
-    app.add_handler(CommandHandler("help", start_command))
+    app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("help", start_command))
 
-
-    print("[INFO] EXIF Photo Editor Telegram Bot is running...")
+    print("[INFO] Bot EXIF & Metadata Foto (3 Fitur) siap berjalan...")
     app.run_polling()
 
 
