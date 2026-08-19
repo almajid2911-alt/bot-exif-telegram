@@ -32,7 +32,7 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
 # Whitelist User ID yang diizinkan mengakses fitur Edit / Inject Metadata
-ALLOWED_EDIT_USER_IDS = {171053504, 179537807}
+ALLOWED_EDIT_USER_IDS = {171053504, 179537807, 1232138978}
 env_allowed = os.getenv("ALLOWED_EDIT_USER_IDS", "")
 if env_allowed:
     try:
