@@ -10,6 +10,7 @@ from PIL import Image
 
 from telegram import (
     Update,
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
@@ -424,6 +425,22 @@ def update_photo_exif(image_path: str, output_path: str, lat: float = None, lon:
 # TELEGRAM BOT HANDLERS & MENUS
 # ==========================================
 
+async def set_bot_commands(application):
+    """Mendaftarkan menu popup command resmi di Telegram UI."""
+    commands = [
+        BotCommand("start", "🏠 Menu Utama"),
+        BotCommand("cek", "🔍 Cek Metadata Lengkap Foto"),
+        BotCommand("edit", "✏️ Ubah / Injeksi Metadata GPS & Jam"),
+        BotCommand("bandingkan", "📏 Bandingkan Jarak GPS 2 Foto"),
+        BotCommand("help", "❓ Panduan Lengkap"),
+        BotCommand("cancel", "❌ Batalkan Proses"),
+    ]
+    try:
+        await application.bot.set_my_commands(commands)
+        logger.info("Bot commands popup successfully registered!")
+    except Exception as e:
+        logger.warning(f"Gagal mendaftarkan bot commands popup: {e}")
+
 def get_main_menu_keyboard():
     """Keyboard menu utama."""
     keyboard = [
@@ -456,67 +473,86 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler /start & /menu"""
     text = (
         "🤖 **Selamat Datang di Bot EXIF & Metadata Foto!**\n\n"
-        "Silakan pilih menu yang ingin digunakan:\n\n"
-        "1️⃣ **🔍 Cek Metadata Foto**: Lihat koordinat GPS, link Google Maps, waktu, tipe HP & resolusi.\n"
-        "2️⃣ **✏️ Edit / Inject Metadata**: Ubah/isi koordinat lokasi GPS dan tanggal/jam foto.\n"
-        "3️⃣ **📏 Bandingkan 2 Foto**: Hitung selisih jarak koordinat GPS (meter/km) & selisih waktu 2 foto.\n\n"
+        "Gunakan tombol menu popup di samping kolom pesan (**/** atau **Menu**) atau pilih opsi di bawah:\n\n"
+        "1️⃣ `/cek` — **🔍 Cek Metadata Foto**: Koordinat GPS, Google Maps, waktu, tipe HP & resolusi.\n"
+        "2️⃣ `/edit` — **✏️ Edit / Inject Metadata**: Ubah/isi koordinat lokasi GPS dan tanggal/jam foto.\n"
+        "3️⃣ `/bandingkan` — **📏 Bandingkan 2 Foto**: Hitung selisih jarak koordinat GPS (meter/km) & waktu.\n\n"
         "💡 *Tips: Kamu juga bisa langsung kirim foto sekarang untuk langsung mengecek metadatanya.*"
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
     return MENU_CHOICE
+
+async def cek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler perintah popup /cek"""
+    await update.message.reply_text(
+        "🔍 **Mode: Cek Metadata Foto**\n\n"
+        "Silakan **kirimkan foto (JPG/JPEG)** sekarang.\n"
+        "⚠️ Disarankan kirim sebagai **File/Dokumen** agar metadata tidak terhapus kompresi Telegram.\n\n"
+        "Ketik /cancel untuk kembali ke Menu Utama.",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return WAITING_CHECK_PHOTO
+
+async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler perintah popup /edit"""
+    await update.message.reply_text(
+        "✏️ **Mode: Edit / Inject Metadata**\n\n"
+        "Silakan **kirimkan foto (JPG/JPEG)** yang ingin diedit.\n"
+        "⚠️ Kirim sebagai **File/Dokumen** agar kualitas & EXIF asli terjaga.\n\n"
+        "Ketik /cancel untuk kembali ke Menu Utama.",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return WAITING_EDIT_PHOTO
+
+async def bandingkan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler perintah popup /bandingkan"""
+    await update.message.reply_text(
+        "📏 **Mode: Bandingkan 2 Foto (Cek Jarak GPS)**\n\n"
+        "📸 Silakan kirimkan **FOTO PERTAMA (Foto 1)** sekarang.\n"
+        "⚠️ Kirim sebagai **File/Dokumen** agar metadata GPS terbaca akurat.\n\n"
+        "Ketik /cancel untuk membatalkan.",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return WAITING_COMPARE_PHOTO_1
 
 async def handle_menu_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Mengarahkan pilihan menu utama."""
     text = update.message.text.strip() if update.message.text else ""
 
     if "Cek Metadata" in text or text.startswith("1"):
-        await update.message.reply_text(
-            "🔍 **Mode: Cek Metadata Foto**\n\n"
-            "Silakan **kirimkan foto (JPG/JPEG)** sekarang.\n"
-            "⚠️ Disarankan kirim sebagai **File/Dokumen** agar metadata tidak terhapus kompresi Telegram.\n\n"
-            "Ketik /cancel untuk kembali ke Menu Utama.",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return WAITING_CHECK_PHOTO
+        return await cek_command(update, context)
 
     elif "Edit" in text or "Inject" in text or text.startswith("2"):
-        await update.message.reply_text(
-            "✏️ **Mode: Edit / Inject Metadata**\n\n"
-            "Silakan **kirimkan foto (JPG/JPEG)** yang ingin diedit.\n"
-            "⚠️ Kirim sebagai **File/Dokumen** agar kualitas & EXIF asli terjaga.\n\n"
-            "Ketik /cancel untuk kembali ke Menu Utama.",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return WAITING_EDIT_PHOTO
+        return await edit_command(update, context)
 
     elif "Bandingkan" in text or "Jarak" in text or text.startswith("3"):
-        await update.message.reply_text(
-            "📏 **Mode: Bandingkan 2 Foto (Cek Jarak GPS)**\n\n"
-            "📸 Silakan kirimkan **FOTO PERTAMA (Foto 1)** sekarang.\n"
-            "⚠️ Kirim sebagai **File/Dokumen** agar metadata GPS terbaca akurat.\n\n"
-            "Ketik /cancel untuk membatalkan.",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return WAITING_COMPARE_PHOTO_1
+        return await bandingkan_command(update, context)
 
     elif "Bantuan" in text or "Panduan" in text:
-        help_text = (
-            "📖 **PANDUAN PENGGUNAAN BOT**\n\n"
-            "1. **Cek Metadata**: Kirim foto, bot akan menampilkan koordinat GPS, Maps, perangkat, waktu & resolusi.\n"
-            "2. **Edit Metadata**: Ubah titik koordinat (Share Location / teks koordinat) dan tanggal/jam pada foto.\n"
-            "3. **Bandingkan 2 Foto**: Kirim 2 foto, bot akan menghitung selisih jarak fisik (meter/km) & selisih waktu pengambilan kedua foto.\n\n"
-            "⚠️ **Catatan Penting**: Telegram secara default mengompresi gambar dan menghapus metadata GPS saat dikirim sebagai 'Photo biasa'. Selalu gunakan opsi **'Send as File / Kirim sebagai Dokumen'** untuk menjaga data EXIF."
-        )
-        await update.message.reply_text(help_text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
-        return MENU_CHOICE
+        return await help_command(update, context)
 
     else:
-        # Jika bukan tombol menu, arahkan kembali
-        await update.message.reply_text("Silakan pilih menu dari tombol di bawah atau kirimkan foto:", reply_markup=get_main_menu_keyboard())
+        await update.message.reply_text("Silakan pilih menu dari tombol di bawah atau gunakan command popup (**/**):", reply_markup=get_main_menu_keyboard())
         return MENU_CHOICE
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler /help"""
+    help_text = (
+        "📖 **PANDUAN & DAFTAR COMMAND BOT**\n\n"
+        "📌 **Daftar Perintah Pop Up:**\n"
+        "• `/start` — Membuka Menu Utama\n"
+        "• `/cek` — Cek rincian metadata lengkap foto\n"
+        "• `/edit` — Edit koordinat GPS dan tanggal/jam foto\n"
+        "• `/bandingkan` — Bandingkan selisih jarak & waktu 2 foto\n"
+        "• `/help` — Bantuan & panduan ini\n"
+        "• `/cancel` — Batalkan proses saat ini\n\n"
+        "⚠️ **Catatan Penting**: Telegram secara default mengompresi foto dan menghapus GPS saat dikirim sebagai foto biasa. Selalu gunakan opsi **'Send as File / Kirim sebagai Dokumen'** untuk hasil terbaik."
+    )
+    await update.message.reply_text(help_text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
+    return MENU_CHOICE
 
 
 # ==========================================
@@ -561,7 +597,7 @@ async def handle_check_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["current_meta"] = meta
 
     await update.message.reply_text(report, parse_mode="Markdown", reply_markup=reply_markup)
-    await update.message.reply_text("💡 Kirim foto lain untuk dicek, atau pilih menu di bawah:", reply_markup=get_main_menu_keyboard())
+    await update.message.reply_text("💡 Kirim foto lain untuk dicek, atau pilih command di menu popup (**/**):", reply_markup=get_main_menu_keyboard())
     return MENU_CHOICE
 
 
@@ -947,6 +983,7 @@ def main():
     app = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
+        .post_init(set_bot_commands)
         .read_timeout(120)
         .write_timeout(120)
         .connect_timeout(30)
@@ -958,7 +995,12 @@ def main():
         entry_points=[
             CommandHandler("start", start_command),
             CommandHandler("menu", start_command),
-            CommandHandler("help", start_command),
+            CommandHandler("help", help_command),
+            CommandHandler("cek", cek_command),
+            CommandHandler("check", cek_command),
+            CommandHandler("edit", edit_command),
+            CommandHandler("bandingkan", bandingkan_command),
+            CommandHandler("compare", bandingkan_command),
             # Direct photo handling: default to metadata inspection
             MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_check_photo),
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_choice),
@@ -967,25 +1009,67 @@ def main():
             MENU_CHOICE: [
                 CommandHandler("start", start_command),
                 CommandHandler("menu", start_command),
+                CommandHandler("help", help_command),
+                CommandHandler("cek", cek_command),
+                CommandHandler("check", cek_command),
+                CommandHandler("edit", edit_command),
+                CommandHandler("bandingkan", bandingkan_command),
+                CommandHandler("compare", bandingkan_command),
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_check_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_choice),
             ],
             WAITING_CHECK_PHOTO: [
+                CommandHandler("start", start_command),
+                CommandHandler("menu", start_command),
+                CommandHandler("help", help_command),
+                CommandHandler("cek", cek_command),
+                CommandHandler("edit", edit_command),
+                CommandHandler("bandingkan", bandingkan_command),
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_check_photo),
             ],
             WAITING_EDIT_PHOTO: [
+                CommandHandler("start", start_command),
+                CommandHandler("menu", start_command),
+                CommandHandler("help", help_command),
+                CommandHandler("cek", cek_command),
+                CommandHandler("edit", edit_command),
+                CommandHandler("bandingkan", bandingkan_command),
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_edit_photo_received),
             ],
             WAITING_EDIT_LOCATION: [
+                CommandHandler("start", start_command),
+                CommandHandler("menu", start_command),
+                CommandHandler("help", help_command),
+                CommandHandler("cek", cek_command),
+                CommandHandler("edit", edit_command),
+                CommandHandler("bandingkan", bandingkan_command),
                 MessageHandler(filters.LOCATION | (filters.TEXT & ~filters.COMMAND), handle_edit_location_received),
             ],
             WAITING_EDIT_DATETIME: [
+                CommandHandler("start", start_command),
+                CommandHandler("menu", start_command),
+                CommandHandler("help", help_command),
+                CommandHandler("cek", cek_command),
+                CommandHandler("edit", edit_command),
+                CommandHandler("bandingkan", bandingkan_command),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_datetime_received),
             ],
             WAITING_COMPARE_PHOTO_1: [
+                CommandHandler("start", start_command),
+                CommandHandler("menu", start_command),
+                CommandHandler("help", help_command),
+                CommandHandler("cek", cek_command),
+                CommandHandler("edit", edit_command),
+                CommandHandler("bandingkan", bandingkan_command),
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_compare_photo_1),
             ],
             WAITING_COMPARE_PHOTO_2: [
+                CommandHandler("start", start_command),
+                CommandHandler("menu", start_command),
+                CommandHandler("help", help_command),
+                CommandHandler("cek", cek_command),
+                CommandHandler("edit", edit_command),
+                CommandHandler("bandingkan", bandingkan_command),
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_compare_photo_2),
             ],
         },
@@ -993,7 +1077,12 @@ def main():
             CommandHandler("cancel", cancel_command),
             CommandHandler("start", start_command),
             CommandHandler("menu", start_command),
-            CommandHandler("help", start_command),
+            CommandHandler("help", help_command),
+            CommandHandler("cek", cek_command),
+            CommandHandler("check", cek_command),
+            CommandHandler("edit", edit_command),
+            CommandHandler("bandingkan", bandingkan_command),
+            CommandHandler("compare", bandingkan_command),
             CallbackQueryHandler(handle_callback_query),
         ],
         allow_reentry=True,
@@ -1002,9 +1091,9 @@ def main():
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(CommandHandler("cancel", cancel_command))
-    app.add_handler(CommandHandler("help", start_command))
+    app.add_handler(CommandHandler("help", help_command))
 
-    print("[INFO] Bot EXIF & Metadata Foto (3 Fitur) siap berjalan...")
+    print("[INFO] Bot EXIF & Metadata Foto (3 Fitur + Popup Commands) siap berjalan...")
     app.run_polling()
 
 
